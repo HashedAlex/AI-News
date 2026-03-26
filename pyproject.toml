@@ -1,0 +1,12 @@
+[project]
+name = "ai-news"
+version = "0.1.0"
+description = "Telegram bot for fetching AI news from XCancel RSS feeds"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.26.0",
+    "httpx>=0.28.1",
+    "openai>=1.0.0",
+    "python-dotenv>=1.2.2",
+]
