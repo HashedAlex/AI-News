@@ -455,6 +455,35 @@ def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[N
 async def push_news(bot: Bot, db: Database) -> PushStats:
     provider = get_provider()
     feeds = provider.get_feeds()
+
+    # --- 临时诊断：测试 RSSHub 连通性 ---
+    if isinstance(provider, RSSHubProvider):
+        diag_url = provider.base_url
+        print(f"[DIAG] RSSHub base_url = {diag_url}", flush=True)
+        import socket
+        try:
+            host = urlparse(diag_url).hostname
+            ip = socket.getaddrinfo(host, 443, socket.AF_INET)
+            print(f"[DIAG] DNS resolve {host} -> {ip[0][4][0]}", flush=True)
+        except Exception as e:
+            print(f"[DIAG] DNS resolve FAILED for {host}: {type(e).__name__}: {e}", flush=True)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as diag_client:
+                r = await diag_client.get(diag_url, follow_redirects=True)
+                print(f"[DIAG] GET {diag_url} -> status={r.status_code}, len={len(r.text)}", flush=True)
+        except Exception as e:
+            print(f"[DIAG] GET {diag_url} FAILED: {type(e).__name__}: {e}", flush=True)
+        first_feed_url = next(iter(feeds.values()), None)
+        if first_feed_url:
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as diag_client:
+                    r = await diag_client.get(first_feed_url, follow_redirects=True)
+                    print(f"[DIAG] Feed test {first_feed_url} -> status={r.status_code}, len={len(r.text)}", flush=True)
+                    print(f"[DIAG] Feed body preview: {r.text[:300]}", flush=True)
+            except Exception as e:
+                print(f"[DIAG] Feed test {first_feed_url} FAILED: {type(e).__name__}: {e}", flush=True)
+    # --- 诊断结束 ---
+
     openrouter_api_key, openrouter_model = load_translation_settings()
     translation_client = (
         AsyncOpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL)
