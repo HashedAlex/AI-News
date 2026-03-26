@@ -17,7 +17,8 @@ import httpx
 from aiogram import Bot, Dispatcher, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -380,20 +381,52 @@ def format_published_time(published: str) -> str:
     return published_at.astimezone(SINGAPORE_TZ).strftime("%Y-%m-%d %H:%M")
 
 
-def format_broadcast_message(
-    item: NewsItem,
-    translated_text: str,
+TRUNCATE_LENGTH = 200
+
+# In-memory cache for expand/collapse: msg_key -> (short_html, full_html)
+_message_texts: dict[str, tuple[str, str]] = {}
+_MSG_CACHE_MAX = 500
+
+
+def _msg_key(chat_id: int, message_id: int) -> str:
+    return f"{chat_id}:{message_id}"
+
+
+def _build_message(
+    author: str,
+    published_time: str,
+    content: str,
+    link: str,
 ) -> str:
-    author = html.escape(item.source)
-    published_time = html.escape(format_published_time(item.published))
-    content = html.escape(translated_text)
-    link = html.escape(item.link)
     return (
         f"<b>👤 {author}</b>\n\n"
         f"<b>📅 {published_time}</b>\n\n"
         f"<b>中文内容：</b>\n{content}\n\n"
         f"<a href=\"{link}\">🔗 原始链接</a>"
     )
+
+
+def format_broadcast_message(
+    item: NewsItem,
+    translated_text: str,
+) -> tuple[str, str | None]:
+    """Return (short_message, full_message_or_None).
+
+    If the content is short enough, full_message is None (no expand needed).
+    """
+    author = html.escape(item.source)
+    published_time = html.escape(format_published_time(item.published))
+    full_content = html.escape(translated_text)
+    link = html.escape(item.link)
+
+    full_msg = _build_message(author, published_time, full_content, link)
+
+    if len(translated_text) <= TRUNCATE_LENGTH:
+        return full_msg, None
+
+    truncated = html.escape(translated_text[:TRUNCATE_LENGTH]) + "…"
+    short_msg = _build_message(author, published_time, truncated, link)
+    return short_msg, full_msg
 
 
 def should_remove_subscriber(exc: Exception) -> bool:
@@ -408,15 +441,31 @@ async def broadcast_item(
     bot: Bot,
     db: Database,
     chat_ids: list[int],
-    message_text: str,
+    short_text: str,
+    full_text: str | None,
 ) -> list[int]:
     if not chat_ids:
         return []
 
+    reply_markup = None
+    if full_text is not None:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="显示全文", callback_data="expand")
+        reply_markup = builder.as_markup()
+
     active_chat_ids: list[int] = []
     for index, chat_id in enumerate(chat_ids):
         try:
-            await bot.send_message(chat_id=chat_id, text=message_text, parse_mode="HTML")
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=short_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            if full_text is not None:
+                if len(_message_texts) >= _MSG_CACHE_MAX:
+                    _message_texts.clear()
+                _message_texts[_msg_key(chat_id, sent.message_id)] = (short_text, full_text)
             active_chat_ids.append(chat_id)
         except Exception as exc:
             print(f"Failed to send item to {chat_id}: {exc}")
@@ -546,15 +595,17 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
                         translated_text = item.title
                         translation_failures += 1
 
-                    message_text = format_broadcast_message(item, translated_text)
+                    short_text, full_text = format_broadcast_message(item, translated_text)
                     subscribers = await broadcast_item(
                         bot,
                         db,
                         subscribers,
-                        message_text,
+                        short_text,
+                        full_text,
                     )
                     total_sent += len(subscribers)
-                    del message_text
+                    del short_text
+                    del full_text
                     del translated_text
             else:
                 print(f"No subscribers. Updated {source} to latest tweet only.", flush=True)
@@ -662,6 +713,32 @@ async def handle_run_now(message: Message) -> None:
     except Exception as exc:
         print(f"Manual run failed: {exc}", flush=True)
         await message.answer(f"本次手动抓取失败：{html.escape(str(exc))}")
+
+
+@router.callback_query(lambda cb: cb.data in ("expand", "collapse"))
+async def handle_expand_collapse(callback: CallbackQuery) -> None:
+    msg = callback.message
+    if msg is None:
+        await callback.answer()
+        return
+
+    key = _msg_key(msg.chat.id, msg.message_id)
+    texts = _message_texts.get(key)
+    if texts is None:
+        await callback.answer("消息已过期，无法展开。")
+        return
+
+    short_text, full_text = texts
+    if callback.data == "expand":
+        builder = InlineKeyboardBuilder()
+        builder.button(text="隐藏", callback_data="collapse")
+        await msg.edit_text(full_text, parse_mode="HTML", reply_markup=builder.as_markup())
+    else:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="显示全文", callback_data="expand")
+        await msg.edit_text(short_text, parse_mode="HTML", reply_markup=builder.as_markup())
+
+    await callback.answer()
 
 
 async def main() -> None:
