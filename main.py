@@ -340,6 +340,8 @@ async def push_news(bot: Bot, db: Database) -> None:
         else None
     )
     subscribers = await db.list_subscribers()
+    print(f"Push cycle started. Subscribers: {len(subscribers)}")
+    total_sent = 0
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(20.0),
@@ -358,6 +360,10 @@ async def push_news(bot: Bot, db: Database) -> None:
             last_seen_id = await db.get_last_seen_id(source)
             latest_item_id = items[0].item_id
             new_items = collect_new_items(items, last_seen_id)
+            print(
+                f"Source={source} latest_id={latest_item_id} "
+                f"last_seen_id={last_seen_id} new_items={len(new_items)}"
+            )
 
             if not new_items:
                 if last_seen_id is None:
@@ -384,6 +390,7 @@ async def push_news(bot: Bot, db: Database) -> None:
                         subscribers,
                         message_text,
                     )
+                    total_sent += len(subscribers)
                     del message_text
                     del translated_text
             else:
@@ -395,6 +402,7 @@ async def push_news(bot: Bot, db: Database) -> None:
 
     if translation_client is not None:
         await translation_client.close()
+    print(f"Push cycle completed. Active subscribers: {len(subscribers)} total_deliveries={total_sent}")
 
 
 def seconds_until_next_run(now: datetime | None = None) -> float:
@@ -455,6 +463,17 @@ async def handle_list(message: Message) -> None:
     await message.answer(f"当前监控的 AI 账号：\n{accounts}")
 
 
+@router.message(Command("run_now"))
+async def handle_run_now(message: Message) -> None:
+    await message.answer("开始立即执行一次抓取，请稍候查看日志和推送结果。")
+    try:
+        await push_news(message.bot, get_db())
+        await message.answer("本次手动抓取已执行完成。")
+    except Exception as exc:
+        print(f"Manual run failed: {exc}")
+        await message.answer(f"本次手动抓取失败：{html.escape(str(exc))}")
+
+
 async def main() -> None:
     global database
 
@@ -464,6 +483,11 @@ async def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     database = Database(DB_PATH)
     await database.init()
+    initial_subscribers = await database.list_subscribers()
+    print(
+        f"Bot starting. data_dir={DATA_DIR} db_path={DB_PATH} "
+        f"subscribers={len(initial_subscribers)} rss_sources={len(RSS_FEEDS)}"
+    )
 
     bot = Bot(load_settings())
     dp = Dispatcher()
