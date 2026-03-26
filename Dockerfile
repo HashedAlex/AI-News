@@ -14,5 +14,6 @@ RUN mkdir -p /app/data
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV DATA_DIR="/app/data"
+ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "main.py"]

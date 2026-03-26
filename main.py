@@ -39,6 +39,16 @@ class NewsItem:
     item_id: str
 
 
+@dataclass(frozen=True)
+class PushStats:
+    subscribers: int
+    sources_checked: int
+    sources_with_updates: int
+    new_items: int
+    deliveries: int
+    translation_failures: int
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -332,7 +342,7 @@ def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[N
     return list(reversed(new_items))
 
 
-async def push_news(bot: Bot, db: Database) -> None:
+async def push_news(bot: Bot, db: Database) -> PushStats:
     openrouter_api_key, openrouter_model = load_translation_settings()
     translation_client = (
         AsyncOpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL)
@@ -340,18 +350,23 @@ async def push_news(bot: Bot, db: Database) -> None:
         else None
     )
     subscribers = await db.list_subscribers()
-    print(f"Push cycle started. Subscribers: {len(subscribers)}")
+    print(f"Push cycle started. Subscribers: {len(subscribers)}", flush=True)
     total_sent = 0
+    sources_checked = 0
+    sources_with_updates = 0
+    total_new_items = 0
+    translation_failures = 0
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(20.0),
         headers={"User-Agent": "AI-News-Bot/0.1"},
     ) as client:
         for source, url in RSS_FEEDS.items():
+            sources_checked += 1
             try:
                 items = await fetch_feed(client, source, url)
             except Exception as exc:
-                print(f"Skipping {source}: {exc}")
+                print(f"Skipping {source}: {exc}", flush=True)
                 continue
 
             if not items:
@@ -363,6 +378,8 @@ async def push_news(bot: Bot, db: Database) -> None:
             print(
                 f"Source={source} latest_id={latest_item_id} "
                 f"last_seen_id={last_seen_id} new_items={len(new_items)}"
+                ,
+                flush=True,
             )
 
             if not new_items:
@@ -370,6 +387,9 @@ async def push_news(bot: Bot, db: Database) -> None:
                     await db.set_last_seen_id(source, latest_item_id)
                 del items
                 continue
+
+            sources_with_updates += 1
+            total_new_items += len(new_items)
 
             if subscribers:
                 for item in new_items:
@@ -380,8 +400,9 @@ async def push_news(bot: Bot, db: Database) -> None:
                             item.title,
                         )
                     except Exception as exc:
-                        print(f"Translation failed for {source}: {exc}")
+                        print(f"Translation failed for {source}: {exc}", flush=True)
                         translated_text = item.title
+                        translation_failures += 1
 
                     message_text = format_broadcast_message(item, translated_text)
                     subscribers = await broadcast_item(
@@ -394,7 +415,7 @@ async def push_news(bot: Bot, db: Database) -> None:
                     del message_text
                     del translated_text
             else:
-                print(f"No subscribers. Updated {source} to latest tweet only.")
+                print(f"No subscribers. Updated {source} to latest tweet only.", flush=True)
 
             await db.set_last_seen_id(source, latest_item_id)
             del new_items
@@ -402,7 +423,21 @@ async def push_news(bot: Bot, db: Database) -> None:
 
     if translation_client is not None:
         await translation_client.close()
-    print(f"Push cycle completed. Active subscribers: {len(subscribers)} total_deliveries={total_sent}")
+    print(
+        f"Push cycle completed. Active subscribers: {len(subscribers)} "
+        f"sources_checked={sources_checked} sources_with_updates={sources_with_updates} "
+        f"new_items={total_new_items} total_deliveries={total_sent} "
+        f"translation_failures={translation_failures}",
+        flush=True,
+    )
+    return PushStats(
+        subscribers=len(subscribers),
+        sources_checked=sources_checked,
+        sources_with_updates=sources_with_updates,
+        new_items=total_new_items,
+        deliveries=total_sent,
+        translation_failures=translation_failures,
+    )
 
 
 def seconds_until_next_run(now: datetime | None = None) -> float:
@@ -426,7 +461,7 @@ async def scraping_loop(bot: Bot, db: Database) -> None:
         try:
             await push_news(bot, db)
         except Exception as exc:
-            print(f"Scraping loop failed: {exc}")
+            print(f"Scraping loop failed: {exc}", flush=True)
 
 
 router = Router()
@@ -467,10 +502,18 @@ async def handle_list(message: Message) -> None:
 async def handle_run_now(message: Message) -> None:
     await message.answer("开始立即执行一次抓取，请稍候查看日志和推送结果。")
     try:
-        await push_news(message.bot, get_db())
-        await message.answer("本次手动抓取已执行完成。")
+        stats = await push_news(message.bot, get_db())
+        await message.answer(
+            "本次手动抓取已执行完成。\n"
+            f"订阅人数：{stats.subscribers}\n"
+            f"检查源数：{stats.sources_checked}\n"
+            f"有更新源数：{stats.sources_with_updates}\n"
+            f"新内容数：{stats.new_items}\n"
+            f"发送总数：{stats.deliveries}\n"
+            f"翻译失败数：{stats.translation_failures}"
+        )
     except Exception as exc:
-        print(f"Manual run failed: {exc}")
+        print(f"Manual run failed: {exc}", flush=True)
         await message.answer(f"本次手动抓取失败：{html.escape(str(exc))}")
 
 
@@ -487,6 +530,8 @@ async def main() -> None:
     print(
         f"Bot starting. data_dir={DATA_DIR} db_path={DB_PATH} "
         f"subscribers={len(initial_subscribers)} rss_sources={len(RSS_FEEDS)}"
+        ,
+        flush=True,
     )
 
     bot = Bot(load_settings())
