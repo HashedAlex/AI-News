@@ -433,7 +433,17 @@ async def broadcast_item(
     return active_chat_ids
 
 
-MAX_NEW_ITEMS_PER_SOURCE = 5
+FRESHNESS_WINDOW = timedelta(hours=2)
+
+
+def _parse_published(published: str) -> datetime | None:
+    try:
+        dt = parsedate_to_datetime(published)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        return dt
+    except (TypeError, ValueError):
+        return None
 
 
 def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[NewsItem]:
@@ -444,24 +454,26 @@ def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[N
     if latest_item_id == last_seen_id:
         return []
 
-    if last_seen_id is None:
-        return [items[0]]
+    now = datetime.now(tz=ZoneInfo("UTC"))
+    cutoff = now - FRESHNESS_WINDOW
 
-    new_items: list[NewsItem] = []
+    # Primary filter: items published within the freshness window
+    fresh_items: list[NewsItem] = []
     for item in items:
         if item.item_id == last_seen_id:
             break
-        new_items.append(item)
+        pub_time = _parse_published(item.published)
+        if pub_time is not None and pub_time >= cutoff:
+            fresh_items.append(item)
 
-    # Cap to avoid flooding after provider switch or first run
-    if len(new_items) > MAX_NEW_ITEMS_PER_SOURCE:
-        print(
-            f"Capping new items from {len(new_items)} to {MAX_NEW_ITEMS_PER_SOURCE}",
-            flush=True,
-        )
-        new_items = new_items[:MAX_NEW_ITEMS_PER_SOURCE]
+    # On first run (no last_seen_id), only send the latest item
+    if last_seen_id is None:
+        return [items[0]] if items else []
 
-    return list(reversed(new_items))
+    if not fresh_items:
+        return []
+
+    return list(reversed(fresh_items))
 
 
 async def push_news(bot: Bot, db: Database) -> PushStats:
