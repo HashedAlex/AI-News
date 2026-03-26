@@ -47,6 +47,11 @@ class PushStats:
     new_items: int
     deliveries: int
     translation_failures: int
+    blocked_sources: int
+
+
+class FeedAccessError(RuntimeError):
+    pass
 
 
 class Database:
@@ -150,6 +155,11 @@ def load_translation_settings() -> tuple[str, str]:
 
 def parse_rss(xml_text: str, source: str) -> list[NewsItem]:
     root = ElementTree.fromstring(xml_text.lstrip())
+    channel_title = (root.findtext("./channel/title") or "").strip()
+    channel_description = (root.findtext("./channel/description") or "").strip()
+    if "RSS reader not yet whitelist" in channel_title or "RSS reader not yet whitelist" in channel_description:
+        raise FeedAccessError(f"{source} feed is not whitelisted by XCancel yet.")
+
     items: list[NewsItem] = []
 
     for item in root.findall("./channel/item"):
@@ -356,6 +366,7 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
     sources_with_updates = 0
     total_new_items = 0
     translation_failures = 0
+    blocked_sources = 0
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(20.0),
@@ -365,6 +376,10 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
             sources_checked += 1
             try:
                 items = await fetch_feed(client, source, url)
+            except FeedAccessError as exc:
+                blocked_sources += 1
+                print(f"Blocked feed for {source}: {exc}", flush=True)
+                continue
             except Exception as exc:
                 print(f"Skipping {source}: {exc}", flush=True)
                 continue
@@ -427,7 +442,7 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
         f"Push cycle completed. Active subscribers: {len(subscribers)} "
         f"sources_checked={sources_checked} sources_with_updates={sources_with_updates} "
         f"new_items={total_new_items} total_deliveries={total_sent} "
-        f"translation_failures={translation_failures}",
+        f"translation_failures={translation_failures} blocked_sources={blocked_sources}",
         flush=True,
     )
     return PushStats(
@@ -437,6 +452,7 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
         new_items=total_new_items,
         deliveries=total_sent,
         translation_failures=translation_failures,
+        blocked_sources=blocked_sources,
     )
 
 
@@ -510,7 +526,8 @@ async def handle_run_now(message: Message) -> None:
             f"有更新源数：{stats.sources_with_updates}\n"
             f"新内容数：{stats.new_items}\n"
             f"发送总数：{stats.deliveries}\n"
-            f"翻译失败数：{stats.translation_failures}"
+            f"翻译失败数：{stats.translation_failures}\n"
+            f"被源站拦截数：{stats.blocked_sources}"
         )
     except Exception as exc:
         print(f"Manual run failed: {exc}", flush=True)
