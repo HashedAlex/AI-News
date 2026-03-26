@@ -4,10 +4,12 @@ import asyncio
 import html
 import os
 import sqlite3
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 from xml.etree import ElementTree
 
@@ -19,7 +21,7 @@ from aiogram.types import Message
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from config import RSS_FEEDS
+from config import ACCOUNTS, PROVIDER, RSSHUB_PLACEHOLDER_URL, XCANCEL_BASE_URL
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "bot_data.db"
@@ -52,6 +54,52 @@ class PushStats:
 
 class FeedAccessError(RuntimeError):
     pass
+
+
+class FeedProvider(ABC):
+    name: str
+
+    @abstractmethod
+    def build_feed_url(self, username: str) -> str:
+        raise NotImplementedError
+
+    def validate_feed(self, root: ElementTree.Element, source: str) -> None:
+        return None
+
+    def get_feeds(self) -> dict[str, str]:
+        return {
+            source: self.build_feed_url(username)
+            for source, username in ACCOUNTS.items()
+        }
+
+
+class XCancelProvider(FeedProvider):
+    name = "xcancel"
+
+    def __init__(self, base_url: str = XCANCEL_BASE_URL) -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def build_feed_url(self, username: str) -> str:
+        return f"{self.base_url}/{username}/rss"
+
+    def validate_feed(self, root: ElementTree.Element, source: str) -> None:
+        channel_title = (root.findtext("./channel/title") or "").strip()
+        channel_description = (root.findtext("./channel/description") or "").strip()
+        if (
+            "RSS reader not yet whitelist" in channel_title
+            or "RSS reader not yet whitelist" in channel_description
+        ):
+            raise FeedAccessError(f"{source} feed is not whitelisted by XCancel yet.")
+
+
+class RSSHubProvider(FeedProvider):
+    name = "rsshub"
+
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def build_feed_url(self, username: str) -> str:
+        return f"{self.base_url}/twitter/user/{username}"
 
 
 class Database:
@@ -153,12 +201,59 @@ def load_translation_settings() -> tuple[str, str]:
     return api_key, model or DEFAULT_OPENROUTER_MODEL
 
 
-def parse_rss(xml_text: str, source: str) -> list[NewsItem]:
+def get_provider() -> FeedProvider:
+    provider_name = PROVIDER.strip().lower()
+    if provider_name == "xcancel":
+        return XCancelProvider()
+
+    if provider_name == "rsshub":
+        rsshub_url = os.getenv("RSSHUB_URL", "").strip()
+        if not rsshub_url:
+            print(
+                f"RSSHUB_URL is missing. Falling back to placeholder {RSSHUB_PLACEHOLDER_URL}",
+                flush=True,
+            )
+            rsshub_url = RSSHUB_PLACEHOLDER_URL
+        return RSSHubProvider(rsshub_url)
+
+    raise RuntimeError(f"Unsupported provider configured: {PROVIDER}")
+
+
+def canonical_item_id(*candidates: str) -> str:
+    for candidate in candidates:
+        value = (candidate or "").strip()
+        if not value:
+            continue
+
+        status_id = extract_status_id(value)
+        if status_id:
+            return status_id
+
+    for candidate in candidates:
+        value = (candidate or "").strip()
+        if value:
+            return value
+
+    return ""
+
+
+def extract_status_id(value: str) -> str | None:
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    for index, part in enumerate(parts[:-1]):
+        if part == "status":
+            return parts[index + 1]
+
+    return None
+
+
+def parse_rss(xml_text: str, source: str, provider: FeedProvider) -> list[NewsItem]:
     root = ElementTree.fromstring(xml_text.lstrip())
-    channel_title = (root.findtext("./channel/title") or "").strip()
-    channel_description = (root.findtext("./channel/description") or "").strip()
-    if "RSS reader not yet whitelist" in channel_title or "RSS reader not yet whitelist" in channel_description:
-        raise FeedAccessError(f"{source} feed is not whitelisted by XCancel yet.")
+    provider.validate_feed(root, source)
 
     items: list[NewsItem] = []
 
@@ -175,7 +270,7 @@ def parse_rss(xml_text: str, source: str) -> list[NewsItem]:
                 title=title,
                 link=link,
                 published=published,
-                item_id=guid or link,
+                item_id=canonical_item_id(guid, link),
             )
         )
 
@@ -202,7 +297,7 @@ def parse_rss(xml_text: str, source: str) -> list[NewsItem]:
                 title=title,
                 link=link,
                 published=published,
-                item_id=entry_id or link,
+                item_id=canonical_item_id(entry_id, link),
             )
         )
 
@@ -219,10 +314,15 @@ def _sort_key(item: NewsItem) -> tuple[int, str]:
     return (int(published_at.timestamp()), item.item_id)
 
 
-async def fetch_feed(client: httpx.AsyncClient, source: str, url: str) -> list[NewsItem]:
+async def fetch_feed(
+    client: httpx.AsyncClient,
+    source: str,
+    url: str,
+    provider: FeedProvider,
+) -> list[NewsItem]:
     response = await client.get(url, follow_redirects=True)
     response.raise_for_status()
-    return parse_rss(response.text, source)
+    return parse_rss(response.text, source, provider)
 
 
 def render_message(item: NewsItem) -> str:
@@ -353,6 +453,8 @@ def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[N
 
 
 async def push_news(bot: Bot, db: Database) -> PushStats:
+    provider = get_provider()
+    feeds = provider.get_feeds()
     openrouter_api_key, openrouter_model = load_translation_settings()
     translation_client = (
         AsyncOpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL)
@@ -372,10 +474,10 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
         timeout=httpx.Timeout(20.0),
         headers={"User-Agent": "AI-News-Bot/0.1"},
     ) as client:
-        for source, url in RSS_FEEDS.items():
+        for source, url in feeds.items():
             sources_checked += 1
             try:
-                items = await fetch_feed(client, source, url)
+                items = await fetch_feed(client, source, url, provider)
             except FeedAccessError as exc:
                 blocked_sources += 1
                 print(f"Blocked feed for {source}: {exc}", flush=True)
@@ -510,8 +612,11 @@ async def handle_stop(message: Message) -> None:
 
 @router.message(Command("list"))
 async def handle_list(message: Message) -> None:
-    accounts = "\n".join(f"- {name}" for name in RSS_FEEDS)
-    await message.answer(f"当前监控的 AI 账号：\n{accounts}")
+    provider = get_provider()
+    accounts = "\n".join(f"- {name}" for name in ACCOUNTS)
+    await message.answer(
+        f"当前 provider：{provider.name}\n当前监控的 AI 账号：\n{accounts}"
+    )
 
 
 @router.message(Command("run_now"))
@@ -537,8 +642,10 @@ async def handle_run_now(message: Message) -> None:
 async def main() -> None:
     global database
 
-    if not RSS_FEEDS:
-        raise RuntimeError("Add at least one XCancel RSS feed URL to config.py.")
+    provider = get_provider()
+    feeds = provider.get_feeds()
+    if not feeds:
+        raise RuntimeError("Add at least one account to config.py.")
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     database = Database(DB_PATH)
@@ -546,7 +653,7 @@ async def main() -> None:
     initial_subscribers = await database.list_subscribers()
     print(
         f"Bot starting. data_dir={DATA_DIR} db_path={DB_PATH} "
-        f"subscribers={len(initial_subscribers)} rss_sources={len(RSS_FEEDS)}"
+        f"subscribers={len(initial_subscribers)} rss_sources={len(feeds)} provider={provider.name}"
         ,
         flush=True,
     )
