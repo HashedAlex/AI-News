@@ -26,7 +26,7 @@ from config import ACCOUNTS, PROVIDER, RSSHUB_PLACEHOLDER_URL, XCANCEL_BASE_URL
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "bot_data.db"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = "google/gemini-2.0-flash-lite-preview-01"
+DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash-lite"
 SCAN_MINUTE = 5
 SEND_DELAY_SECONDS = 0.05
 SINGAPORE_TZ = ZoneInfo("Asia/Singapore")
@@ -433,6 +433,9 @@ async def broadcast_item(
     return active_chat_ids
 
 
+MAX_NEW_ITEMS_PER_SOURCE = 5
+
+
 def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[NewsItem]:
     if not items:
         return []
@@ -449,40 +452,21 @@ def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[N
         if item.item_id == last_seen_id:
             break
         new_items.append(item)
+
+    # Cap to avoid flooding after provider switch or first run
+    if len(new_items) > MAX_NEW_ITEMS_PER_SOURCE:
+        print(
+            f"Capping new items from {len(new_items)} to {MAX_NEW_ITEMS_PER_SOURCE}",
+            flush=True,
+        )
+        new_items = new_items[:MAX_NEW_ITEMS_PER_SOURCE]
+
     return list(reversed(new_items))
 
 
 async def push_news(bot: Bot, db: Database) -> PushStats:
     provider = get_provider()
     feeds = provider.get_feeds()
-
-    # --- 临时诊断：测试 RSSHub 连通性 ---
-    if isinstance(provider, RSSHubProvider):
-        diag_url = provider.base_url
-        print(f"[DIAG] RSSHub base_url = {diag_url}", flush=True)
-        import socket
-        try:
-            host = urlparse(diag_url).hostname
-            ip = socket.getaddrinfo(host, 443, socket.AF_INET)
-            print(f"[DIAG] DNS resolve {host} -> {ip[0][4][0]}", flush=True)
-        except Exception as e:
-            print(f"[DIAG] DNS resolve FAILED for {host}: {type(e).__name__}: {e}", flush=True)
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as diag_client:
-                r = await diag_client.get(diag_url, follow_redirects=True)
-                print(f"[DIAG] GET {diag_url} -> status={r.status_code}, len={len(r.text)}", flush=True)
-        except Exception as e:
-            print(f"[DIAG] GET {diag_url} FAILED: {type(e).__name__}: {e}", flush=True)
-        first_feed_url = next(iter(feeds.values()), None)
-        if first_feed_url:
-            try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as diag_client:
-                    r = await diag_client.get(first_feed_url, follow_redirects=True)
-                    print(f"[DIAG] Feed test {first_feed_url} -> status={r.status_code}, len={len(r.text)}", flush=True)
-                    print(f"[DIAG] Feed body preview: {r.text[:300]}", flush=True)
-            except Exception as e:
-                print(f"[DIAG] Feed test {first_feed_url} FAILED: {type(e).__name__}: {e}", flush=True)
-    # --- 诊断结束 ---
 
     openrouter_api_key, openrouter_model = load_translation_settings()
     translation_client = (
