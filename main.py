@@ -404,7 +404,7 @@ def _build_message(
     return (
         f"<b>👤 {author}</b>\n\n"
         f"<b>📅 {published_time}</b>\n\n"
-        f"<b>中文内容：</b>\n{content}\n\n"
+        f"{content}\n\n"
         f"<a href=\"{link}\">🔗 原始链接</a>"
     )
 
