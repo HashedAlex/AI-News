@@ -260,15 +260,18 @@ def parse_rss(xml_text: str, source: str, provider: FeedProvider) -> list[NewsIt
 
     for item in root.findall("./channel/item"):
         title = (item.findtext("title") or "").strip()
+        description = (item.findtext("description") or "").strip()
         link = (item.findtext("link") or "").strip()
         published = (item.findtext("pubDate") or "").strip()
         guid = (item.findtext("guid") or "").strip()
         if not title or not link:
             continue
+        # Prefer description (full content) over title (often truncated)
+        content = description or title
         items.append(
             NewsItem(
                 source=source,
-                title=title,
+                title=content,
                 link=link,
                 published=published,
                 item_id=canonical_item_id(guid, link),
@@ -381,7 +384,7 @@ def format_published_time(published: str) -> str:
     return published_at.astimezone(SINGAPORE_TZ).strftime("%Y-%m-%d %H:%M")
 
 
-TRUNCATE_LENGTH = 200
+TRUNCATE_LENGTH = 100
 
 # In-memory cache for expand/collapse: msg_key -> (short_html, full_html)
 _message_texts: dict[str, tuple[str, str]] = {}
