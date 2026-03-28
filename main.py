@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import html
 import os
+import random
+import re
 import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -59,6 +61,7 @@ class FeedAccessError(RuntimeError):
 
 class FeedProvider(ABC):
     name: str
+    inter_request_delay: float = 0.0
 
     @abstractmethod
     def build_feed_url(self, username: str) -> str:
@@ -72,6 +75,17 @@ class FeedProvider(ABC):
             source: self.build_feed_url(username)
             for source, username in ACCOUNTS.items()
         }
+
+    async def fetch_items(
+        self,
+        source: str,
+        username: str,
+        client: httpx.AsyncClient,
+    ) -> list[NewsItem]:
+        url = self.build_feed_url(username)
+        response = await client.get(url, follow_redirects=True)
+        response.raise_for_status()
+        return parse_rss(response.text, source, self)
 
 
 class XCancelProvider(FeedProvider):
@@ -101,6 +115,52 @@ class RSSHubProvider(FeedProvider):
 
     def build_feed_url(self, username: str) -> str:
         return f"{self.base_url}/twitter/user/{username}"
+
+
+class TwitterApiIoProvider(FeedProvider):
+    name = "twitterapiio"
+    inter_request_delay = 5.0
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
+    def build_feed_url(self, username: str) -> str:
+        return ""
+
+    async def fetch_items(
+        self,
+        source: str,
+        username: str,
+        client: httpx.AsyncClient,
+    ) -> list[NewsItem]:
+        response = await client.get(
+            "https://api.twitterapi.io/twitter/user/last_tweets",
+            params={"userName": username},
+            headers={"x-api-key": self.api_key},
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("status") != "success":
+            raise RuntimeError(
+                f"TwitterAPI.io error for {source}: {data.get('msg', 'unknown')}"
+            )
+
+        items: list[NewsItem] = []
+        for tweet in data.get("data", {}).get("tweets", []):
+            text = tweet.get("text", "").strip()
+            if not text:
+                continue
+            items.append(
+                NewsItem(
+                    source=source,
+                    title=text,
+                    link=tweet.get("url", ""),
+                    published=tweet.get("createdAt", ""),
+                    item_id=tweet.get("id", ""),
+                )
+            )
+        return sorted(items, key=_sort_key, reverse=True)
 
 
 class Database:
@@ -217,6 +277,14 @@ def get_provider() -> FeedProvider:
             rsshub_url = RSSHUB_PLACEHOLDER_URL
         return RSSHubProvider(rsshub_url)
 
+    if provider_name == "twitterapiio":
+        api_key = os.getenv("TWITTERAPIIO_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "Set TWITTERAPIIO_API_KEY in .env before using twitterapiio provider."
+            )
+        return TwitterApiIoProvider(api_key)
+
     raise RuntimeError(f"Unsupported provider configured: {PROVIDER}")
 
 
@@ -311,22 +379,24 @@ def parse_rss(xml_text: str, source: str, provider: FeedProvider) -> list[NewsIt
 def _sort_key(item: NewsItem) -> tuple[int, str]:
     if not item.published:
         return (0, item.item_id)
-    try:
-        published_at = parsedate_to_datetime(item.published)
-    except (TypeError, ValueError):
+    published_at = _parse_published(item.published)
+    if published_at is None:
         return (0, item.published)
     return (int(published_at.timestamp()), item.item_id)
 
 
-async def fetch_feed(
-    client: httpx.AsyncClient,
-    source: str,
-    url: str,
-    provider: FeedProvider,
-) -> list[NewsItem]:
-    response = await client.get(url, follow_redirects=True)
-    response.raise_for_status()
-    return parse_rss(response.text, source, provider)
+_RE_VIDEO = re.compile(r"<video[^>]*>.*?</video>", re.DOTALL | re.IGNORECASE)
+_RE_TAG = re.compile(r"<[^>]+>")
+_RE_MULTI_NL = re.compile(r"\n{3,}")
+
+
+def clean_tweet_text(text: str) -> str:
+    text = _RE_VIDEO.sub("", text)
+    text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+    text = _RE_TAG.sub("", text)
+    text = html.unescape(text)
+    text = _RE_MULTI_NL.sub("\n\n", text)
+    return text.strip()
 
 
 def render_message(item: NewsItem) -> str:
@@ -373,13 +443,9 @@ def format_published_time(published: str) -> str:
     if not published:
         return "Unknown"
 
-    try:
-        published_at = parsedate_to_datetime(published)
-    except (TypeError, ValueError):
+    published_at = _parse_published(published)
+    if published_at is None:
         return published
-
-    if published_at.tzinfo is None:
-        published_at = published_at.replace(tzinfo=ZoneInfo("UTC"))
 
     return published_at.astimezone(SINGAPORE_TZ).strftime("%Y-%m-%d %H:%M")
 
@@ -489,13 +555,15 @@ FRESHNESS_WINDOW = timedelta(hours=2)
 
 
 def _parse_published(published: str) -> datetime | None:
-    try:
-        dt = parsedate_to_datetime(published)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-        return dt
-    except (TypeError, ValueError):
-        return None
+    for parser in (parsedate_to_datetime, datetime.fromisoformat):
+        try:
+            dt = parser(published)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            return dt
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[NewsItem]:
@@ -530,7 +598,6 @@ def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[N
 
 async def push_news(bot: Bot, db: Database) -> PushStats:
     provider = get_provider()
-    feeds = provider.get_feeds()
 
     openrouter_api_key, openrouter_model = load_translation_settings()
     translation_client = (
@@ -551,10 +618,13 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
         timeout=httpx.Timeout(20.0),
         headers={"User-Agent": "AI-News-Bot/0.1"},
     ) as client:
-        for source, url in feeds.items():
+        for source, username in ACCOUNTS.items():
+            if sources_checked > 0 and provider.inter_request_delay > 0:
+                delay = provider.inter_request_delay + random.uniform(0, 2)
+                await asyncio.sleep(delay)
             sources_checked += 1
             try:
-                items = await fetch_feed(client, source, url, provider)
+                items = await provider.fetch_items(source, username, client)
             except FeedAccessError as exc:
                 blocked_sources += 1
                 print(f"Blocked feed for {source}: {exc}", flush=True)
@@ -588,14 +658,15 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
             if subscribers:
                 for item in new_items:
                     try:
+                        cleaned_text = clean_tweet_text(item.title)
                         translated_text = await translate_tweet(
                             translation_client,
                             openrouter_model,
-                            item.title,
+                            cleaned_text,
                         )
                     except Exception as exc:
                         print(f"Translation failed for {source}: {exc}", flush=True)
-                        translated_text = item.title
+                        translated_text = cleaned_text
                         translation_failures += 1
 
                     short_text, full_text = format_broadcast_message(item, translated_text)
@@ -748,8 +819,7 @@ async def main() -> None:
     global database
 
     provider = get_provider()
-    feeds = provider.get_feeds()
-    if not feeds:
+    if not ACCOUNTS:
         raise RuntimeError("Add at least one account to config.py.")
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -758,7 +828,7 @@ async def main() -> None:
     initial_subscribers = await database.list_subscribers()
     print(
         f"Bot starting. data_dir={DATA_DIR} db_path={DB_PATH} "
-        f"subscribers={len(initial_subscribers)} rss_sources={len(feeds)} provider={provider.name}"
+        f"subscribers={len(initial_subscribers)} sources={len(ACCOUNTS)} provider={provider.name}"
         ,
         flush=True,
     )
