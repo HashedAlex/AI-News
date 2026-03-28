@@ -551,7 +551,7 @@ async def broadcast_item(
     return active_chat_ids
 
 
-FRESHNESS_WINDOW = timedelta(hours=2)
+FRESHNESS_WINDOW = timedelta(hours=1)
 
 
 def _parse_published(published: str) -> datetime | None:
@@ -577,7 +577,8 @@ def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[N
     now = datetime.now(tz=ZoneInfo("UTC"))
     cutoff = now - FRESHNESS_WINDOW
 
-    # Primary filter: items published within the freshness window
+    # Primary filter: only items within the freshness window
+    # Secondary filter: stop at last_seen_id to avoid re-sending
     fresh_items: list[NewsItem] = []
     for item in items:
         if item.item_id == last_seen_id:
@@ -585,10 +586,6 @@ def collect_new_items(items: list[NewsItem], last_seen_id: str | None) -> list[N
         pub_time = _parse_published(item.published)
         if pub_time is not None and pub_time >= cutoff:
             fresh_items.append(item)
-
-    # On first run (no last_seen_id), only send the latest item
-    if last_seen_id is None:
-        return [items[0]] if items else []
 
     if not fresh_items:
         return []
