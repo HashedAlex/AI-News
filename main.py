@@ -30,6 +30,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "bot_data.db"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash-lite"
+SCAN_HOUR = 15  # 3 PM daily
 SCAN_MINUTE = 5
 SEND_DELAY_SECONDS = 0.05
 SINGAPORE_TZ = ZoneInfo("Asia/Singapore")
@@ -119,7 +120,7 @@ class RSSHubProvider(FeedProvider):
 
 class TwitterApiIoProvider(FeedProvider):
     name = "twitterapiio"
-    inter_request_delay = 5.0
+    inter_request_delay = 0.0  # batch query, no per-source delay needed
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
@@ -133,33 +134,49 @@ class TwitterApiIoProvider(FeedProvider):
         username: str,
         client: httpx.AsyncClient,
     ) -> list[NewsItem]:
-        response = await client.get(
-            "https://api.twitterapi.io/twitter/user/last_tweets",
-            params={"userName": username},
-            headers={"x-api-key": self.api_key},
+        """Fetch via advanced_search for a single user (past 24h)."""
+        since = (datetime.now(tz=ZoneInfo("UTC")) - timedelta(hours=24)).strftime(
+            "%Y-%m-%d_%H:%M:%S_UTC"
         )
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("status") != "success":
-            raise RuntimeError(
-                f"TwitterAPI.io error for {source}: {data.get('msg', 'unknown')}"
-            )
-
+        query = f"from:{username} since:{since}"
         items: list[NewsItem] = []
-        for tweet in data.get("data", {}).get("tweets", []):
-            text = tweet.get("text", "").strip()
-            if not text:
-                continue
-            items.append(
-                NewsItem(
-                    source=source,
-                    title=text,
-                    link=tweet.get("url", ""),
-                    published=tweet.get("createdAt", ""),
-                    item_id=tweet.get("id", ""),
-                )
+        cursor = ""
+
+        while True:
+            params: dict[str, str] = {
+                "query": query,
+                "queryType": "Latest",
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            response = await client.get(
+                "https://api.twitterapi.io/twitter/tweet/advanced_search",
+                params=params,
+                headers={"x-api-key": self.api_key},
             )
+            response.raise_for_status()
+            data = response.json()
+
+            for tweet in data.get("tweets", []):
+                text = tweet.get("text", "").strip()
+                if not text:
+                    continue
+                items.append(
+                    NewsItem(
+                        source=source,
+                        title=text,
+                        link=tweet.get("url", ""),
+                        published=tweet.get("createdAt", ""),
+                        item_id=tweet.get("id", ""),
+                    )
+                )
+
+            if data.get("has_next_page") and data.get("next_cursor"):
+                cursor = data["next_cursor"]
+            else:
+                break
+
         return sorted(items, key=_sort_key, reverse=True)
 
 
@@ -551,7 +568,7 @@ async def broadcast_item(
     return active_chat_ids
 
 
-FRESHNESS_WINDOW = timedelta(hours=1)
+FRESHNESS_WINDOW = timedelta(hours=24)
 
 
 def _parse_published(published: str) -> datetime | None:
@@ -707,13 +724,11 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
 
 def seconds_until_next_run(now: datetime | None = None) -> float:
     current = now or datetime.now()
-    next_run = current.replace(minute=SCAN_MINUTE, second=0, microsecond=0)
+    next_run = current.replace(
+        hour=SCAN_HOUR, minute=SCAN_MINUTE, second=0, microsecond=0
+    )
     if current >= next_run:
-        next_run = (current + timedelta(hours=1)).replace(
-            minute=SCAN_MINUTE,
-            second=0,
-            microsecond=0,
-        )
+        next_run = next_run + timedelta(days=1)
     return max((next_run - current).total_seconds(), 0.0)
 
 
