@@ -723,7 +723,7 @@ async def push_news(bot: Bot, db: Database) -> PushStats:
 
 
 def seconds_until_next_run(now: datetime | None = None) -> float:
-    current = now or datetime.now()
+    current = now or datetime.now(tz=SINGAPORE_TZ)
     next_run = current.replace(
         hour=SCAN_HOUR, minute=SCAN_MINUTE, second=0, microsecond=0
     )
