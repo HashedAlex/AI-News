@@ -120,7 +120,7 @@ class RSSHubProvider(FeedProvider):
 
 class TwitterApiIoProvider(FeedProvider):
     name = "twitterapiio"
-    inter_request_delay = 3.0  # delay between requests to avoid 429 rate limits
+    inter_request_delay = 5.0  # delay between requests to avoid 429 rate limits
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
@@ -174,6 +174,7 @@ class TwitterApiIoProvider(FeedProvider):
 
             if data.get("has_next_page") and data.get("next_cursor"):
                 cursor = data["next_cursor"]
+                await asyncio.sleep(3.0)
             else:
                 break
 
