@@ -120,7 +120,7 @@ class RSSHubProvider(FeedProvider):
 
 class TwitterApiIoProvider(FeedProvider):
     name = "twitterapiio"
-    inter_request_delay = 0.0  # batch query, no per-source delay needed
+    inter_request_delay = 3.0  # delay between requests to avoid 429 rate limits
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
