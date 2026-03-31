@@ -172,11 +172,9 @@ class TwitterApiIoProvider(FeedProvider):
                     )
                 )
 
-            if data.get("has_next_page") and data.get("next_cursor"):
-                cursor = data["next_cursor"]
-                await asyncio.sleep(3.0)
-            else:
-                break
+            # First page is sufficient for daily checks — skip pagination
+            # to avoid 429 rate limits from TwitterAPI.io
+            break
 
         return sorted(items, key=_sort_key, reverse=True)
 
