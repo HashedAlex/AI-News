@@ -138,7 +138,7 @@ class TwitterApiIoProvider(FeedProvider):
         since = (datetime.now(tz=ZoneInfo("UTC")) - timedelta(hours=24)).strftime(
             "%Y-%m-%d_%H:%M:%S_UTC"
         )
-        query = f"from:{username} since:{since}"
+        query = f"from:{username} -filter:replies since:{since}"
         items: list[NewsItem] = []
         cursor = ""
 
